@@ -95,7 +95,7 @@ class PtbxlDS(torch.utils.data.Dataset):
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
-    ds = PtbxlDS(lowres=True)
+    ds = PtbxlDS(lowres=False)
     dl = DataLoader(dataset=ds, batch_size=32)
 
     for batch in dl:
