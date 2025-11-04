@@ -20,15 +20,16 @@ def calculate_losses(m: ConvolutionalEcgVAE, batch: Tuple[torch.Tensor, dict]):
     reconstruction, mean, logvar = m(signal)
     # NOTE: the loss reduction for variational autoencoder must be sum
     reproduction_loss = F.mse_loss(reconstruction, signal, reduction="sum")
+    mean_mse = F.mse_loss(reconstruction, signal, reduction="mean")
     KLD = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
 
-    return reproduction_loss + KLD, reproduction_loss, KLD
+    return reproduction_loss + KLD, reproduction_loss, KLD, mean_mse
 
 
 def calculate_losses_for_backprop(
     m: ConvolutionalEcgVAE, batch: Tuple[torch.Tensor, dict]
 ):
-    loss, _, _ = calculate_losses(m, batch)
+    loss, _, _, _ = calculate_losses(m, batch)
     return loss
 
 
@@ -45,7 +46,7 @@ if __name__ == "__main__":
     summary(model, input_data=torch.randn((32, 1, 1000)).to("cuda"))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25_000)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25_000)
     best_val_loss = float("inf")
 
     for epoch in range(MAX_EPOCHS):
@@ -55,7 +56,8 @@ if __name__ == "__main__":
             if batchnum % VAL_CHECK_INTERVAL == 0:
                 model.eval()
 
-                val_combined_loss, val_reproduction_loss, val_kld = (
+                val_combined_loss, val_reproduction_loss, val_kld, val_mean_mse = (
+                    MeanMetric().to("cuda"),
                     MeanMetric().to("cuda"),
                     MeanMetric().to("cuda"),
                     MeanMetric().to("cuda"),
@@ -79,13 +81,14 @@ if __name__ == "__main__":
                         plt.savefig("./cache/sample.png")
                         plt.clf()
 
-                    combined_loss, reproduction_loss, KLD = calculate_losses(
+                    combined_loss, reproduction_loss, KLD, mean_mse = calculate_losses(
                         model, val_batch
                     )
 
                     val_combined_loss.update(combined_loss)
                     val_reproduction_loss.update(reproduction_loss)
                     val_kld.update(KLD)
+                    val_mean_mse.update(mean_mse)
 
                 if val_combined_loss.compute() < best_val_loss:
                     best_val_loss = val_combined_loss.compute()
@@ -98,6 +101,7 @@ if __name__ == "__main__":
 
                 print(f"\tVal Combined Loss: {val_combined_loss.compute():5f}")
                 print(f"\tVal Reproduction Loss: {val_reproduction_loss.compute():5f}")
+                print(f"\tVal Mean MSE: {val_mean_mse.compute():5f}")
                 print(f"\tVal KLD: {val_kld.compute():5f}")
 
                 model.train()
@@ -107,4 +111,4 @@ if __name__ == "__main__":
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=4.0)
             optimizer.step()
-            # scheduler.step()
+            scheduler.step()
