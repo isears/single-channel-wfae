@@ -123,8 +123,8 @@ class ConvolutionalEcgVAE(torch.nn.Module):
 
     def encode(self, x):
         enc_raw, _, _ = self.encoder(x)
-        mu = self.fc_mean(enc_raw)
-        sigma = self.fc_logvar(enc_raw)
+        mu = self.fc_mean(enc_raw.squeeze())
+        sigma = self.fc_logvar(enc_raw.squeeze())
 
         # Reparameterization
         batch, dim = mu.shape

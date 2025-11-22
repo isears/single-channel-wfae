@@ -11,7 +11,7 @@ from torchmetrics import MetricCollection
 
 MAX_EPOCHS = 100
 VAL_CHECK_INTERVAL = 500
-LEARNING_RATE = 0.01
+LEARNING_RATE = 0.0001
 
 
 def calculate_losses(m: ConvolutionalEcgVAE, batch: Tuple[torch.Tensor, dict]):
@@ -39,15 +39,16 @@ if __name__ == "__main__":
 
     train_ds, val_ds = random_split(ds, lengths=[0.9, 0.1])
 
-    train_dl = DataLoader(train_ds, batch_size=1024)
+    train_dl = DataLoader(train_ds, batch_size=32)
     val_dl = DataLoader(val_ds, batch_size=len(val_ds))
 
     model = ConvolutionalEcgVAE(n_filters=8, latent_dim=64).to("cuda")
     summary(model, input_data=torch.randn((32, 1, 1000)).to("cuda"))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25_000)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2)
     best_val_loss = float("inf")
+    curr_val_loss = float("inf")
 
     for epoch in range(MAX_EPOCHS):
         print(f"--> Training epoch {epoch}")
@@ -90,14 +91,15 @@ if __name__ == "__main__":
                     val_kld.update(KLD)
                     val_mean_mse.update(mean_mse)
 
-                if val_combined_loss.compute() < best_val_loss:
-                    best_val_loss = val_combined_loss.compute()
+                curr_val_loss = val_combined_loss.compute()
+                if curr_val_loss < best_val_loss:
+                    best_val_loss = curr_val_loss
 
-                    print(f"Step {batchnum:04d} (*)")
+                    print(f"Step {batchnum:04d} {scheduler.get_last_lr()}(*)")
                     torch.save(model.state_dict(), "cache/savedmodels/ecgvae.pt")
 
                 else:
-                    print(f"Step {batchnum:04d}")
+                    print(f"Step {batchnum:04d} {scheduler.get_last_lr()}")
 
                 print(f"\tVal Combined Loss: {val_combined_loss.compute():5f}")
                 print(f"\tVal Reproduction Loss: {val_reproduction_loss.compute():5f}")
@@ -111,4 +113,5 @@ if __name__ == "__main__":
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=4.0)
             optimizer.step()
-            scheduler.step()
+
+        scheduler.step(curr_val_loss)

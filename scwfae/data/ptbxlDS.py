@@ -92,6 +92,30 @@ class PtbxlDS(torch.utils.data.Dataset):
         return torch.Tensor(sig_clean).float(), labels
 
 
+class PtbxlAllChanDS(PtbxlDS):
+    def __getitem__(self, index: int):
+        # Outputs ECG data of shape sig_len x num_leads (e.g. for low res 1000 x 12)
+        patient_id = self.patient_ids[index]
+        available_exams = self.pid_groups.get_group(patient_id)
+        selected_exam = available_exams.sample(1, random_state=42).iloc[0]
+
+        ecg_id = selected_exam["ecg_id"]
+        sig, sigmeta = load_single_ptbxl_record(
+            ecg_id, lowres=self.lowres, root_dir=self.root_folder
+        )
+
+        labels = {c: bool(selected_exam[c].item()) for c in self.ordered_labels}
+
+        sig_clean = np.apply_along_axis(
+            nk.ecg_clean,  # type: ignore
+            1,
+            sig.transpose(),  # type: ignore
+            sampling_rate=sigmeta["fs"],
+        )  # type: ignore
+
+        return torch.Tensor(sig_clean).float(), labels
+
+
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
