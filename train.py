@@ -42,72 +42,73 @@ if __name__ == "__main__":
     train_dl = DataLoader(train_ds, batch_size=32)
     val_dl = DataLoader(val_ds, batch_size=len(val_ds))
 
-    model = ConvolutionalEcgVAE(n_filters=8, latent_dim=64).to("cuda")
+    model = ConvolutionalEcgVAE(n_filters=32, latent_dim=2).to("cuda")
     summary(model, input_data=torch.randn((32, 1, 1000)).to("cuda"))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=2, factor=0.5
+    )
     best_val_loss = float("inf")
     curr_val_loss = float("inf")
 
     for epoch in range(MAX_EPOCHS):
         print(f"--> Training epoch {epoch}")
 
-        for batchnum, batch in enumerate(train_dl):
-            if batchnum % VAL_CHECK_INTERVAL == 0:
-                model.eval()
+        model.eval()
 
-                val_combined_loss, val_reproduction_loss, val_kld, val_mean_mse = (
-                    MeanMetric().to("cuda"),
-                    MeanMetric().to("cuda"),
-                    MeanMetric().to("cuda"),
-                    MeanMetric().to("cuda"),
+        val_combined_loss, val_reproduction_loss, val_kld, val_mean_mse = (
+            MeanMetric().to("cuda"),
+            MeanMetric().to("cuda"),
+            MeanMetric().to("cuda"),
+            MeanMetric().to("cuda"),
+        )
+
+        for val_batchnum, val_batch in enumerate(val_dl):
+            # Save a sample from the first batch
+            if val_batchnum == 0:
+                signal, labels = val_batch
+                reconstruction, _, _ = model(signal.unsqueeze(1).to("cuda"))
+                plt.plot(
+                    range(1000),
+                    signal[0, :].detach().cpu().numpy(),
+                    label="original",
                 )
+                plt.plot(
+                    range(1000),
+                    reconstruction[0, :].squeeze().detach().cpu().numpy(),
+                    label="reconstruction",
+                )
+                plt.savefig("./cache/sample.png")
+                plt.clf()
 
-                for val_batchnum, val_batch in enumerate(val_dl):
-                    # Save a sample from the first batch
-                    if val_batchnum == 0:
-                        signal, labels = val_batch
-                        reconstruction, _, _ = model(signal.unsqueeze(1).to("cuda"))
-                        plt.plot(
-                            range(1000),
-                            signal[0, :].detach().cpu().numpy(),
-                            label="original",
-                        )
-                        plt.plot(
-                            range(1000),
-                            reconstruction[0, :].squeeze().detach().cpu().numpy(),
-                            label="reconstruction",
-                        )
-                        plt.savefig("./cache/sample.png")
-                        plt.clf()
+            combined_loss, reproduction_loss, KLD, mean_mse = calculate_losses(
+                model, val_batch
+            )
 
-                    combined_loss, reproduction_loss, KLD, mean_mse = calculate_losses(
-                        model, val_batch
-                    )
+            val_combined_loss.update(combined_loss)
+            val_reproduction_loss.update(reproduction_loss)
+            val_kld.update(KLD)
+            val_mean_mse.update(mean_mse)
 
-                    val_combined_loss.update(combined_loss)
-                    val_reproduction_loss.update(reproduction_loss)
-                    val_kld.update(KLD)
-                    val_mean_mse.update(mean_mse)
+        curr_val_loss = val_combined_loss.compute()
+        if curr_val_loss < best_val_loss:
+            best_val_loss = curr_val_loss
 
-                curr_val_loss = val_combined_loss.compute()
-                if curr_val_loss < best_val_loss:
-                    best_val_loss = curr_val_loss
+            print(f"Epoch {epoch:04d} {scheduler.get_last_lr()}(*)")
+            torch.save(model.state_dict(), "cache/savedmodels/ecgvae.pt")
 
-                    print(f"Step {batchnum:04d} {scheduler.get_last_lr()}(*)")
-                    torch.save(model.state_dict(), "cache/savedmodels/ecgvae.pt")
+        else:
+            print(f"Epoch {epoch:04d} {scheduler.get_last_lr()}")
 
-                else:
-                    print(f"Step {batchnum:04d} {scheduler.get_last_lr()}")
+        print(f"\tVal Combined Loss: {val_combined_loss.compute():5f}")
+        print(f"\tVal Reproduction Loss: {val_reproduction_loss.compute():5f}")
+        print(f"\tVal Mean MSE: {val_mean_mse.compute():5f}")
+        print(f"\tVal KLD: {val_kld.compute():5f}")
 
-                print(f"\tVal Combined Loss: {val_combined_loss.compute():5f}")
-                print(f"\tVal Reproduction Loss: {val_reproduction_loss.compute():5f}")
-                print(f"\tVal Mean MSE: {val_mean_mse.compute():5f}")
-                print(f"\tVal KLD: {val_kld.compute():5f}")
+        model.train()
 
-                model.train()
-
+        for batchnum, batch in enumerate(train_dl):
             loss = calculate_losses_for_backprop(model, batch)
             optimizer.zero_grad()
             loss.backward()

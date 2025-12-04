@@ -54,18 +54,21 @@ class PtbxlDS(torch.utils.data.Dataset):
 
         # Get PTBXL labels
         self.metadata.scp_codes = self.metadata.scp_codes.apply(ast.literal_eval)
-
-        # Modified from physionet example.py
         scp_codes = pd.read_csv(f"{root_folder}/scp_statements.csv", index_col=0)
-        scp_codes = scp_codes[scp_codes.diagnostic == 1]
+        scp_codes["codename"] = scp_codes.index
+        major_codes = (
+            scp_codes.groupby("diagnostic_class")
+            .agg({"codename": list})
+            .to_dict()["codename"]
+        )
 
         self.ordered_labels = list()
 
-        for diagnostic_code, description in zip(scp_codes.index, scp_codes.description):
-            self.ordered_labels.append(description)
-            self.metadata[description] = self.metadata.scp_codes.apply(
-                lambda x: diagnostic_code in x.keys()
-            ).astype(float)
+        for major_code, subcodes in major_codes.items():
+            self.ordered_labels.append(major_code)
+            self.metadata[major_code] = self.metadata.scp_codes.apply(
+                lambda x: len(set(subcodes + [major_code]) & set(x.keys())) > 0
+            )
 
     def __len__(self):
         return len(self.pid_groups)
