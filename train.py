@@ -69,9 +69,8 @@ if __name__ == "__main__":
             seq_len=1000,
             kernel_size=15,
             conv_depth=5,
-            fc_depth=1,
-            fc_scale_factor=4,
             latent_dim=25,
+            n_filters=16,
         )
     ).to("cuda")
     summary(model, input_data=torch.randn((32, 1, 1000)).to("cuda"))

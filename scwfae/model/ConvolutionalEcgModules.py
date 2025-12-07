@@ -41,9 +41,8 @@ class ConvolutionalEcgEncoderDecoderSharedParams:
     seq_len: int
     kernel_size: int
     conv_depth: int
-    fc_depth: int
     latent_dim: int
-    fc_scale_factor: int
+    n_filters: int
 
     def __post_init__(self):
         self.input_padding_required = False
@@ -62,27 +61,9 @@ class ConvolutionalEcgEncoderDecoderSharedParams:
 
         self.layer_padding = (self.kernel_size - 1) // 2
 
-        self.linear_input_sizes = [
-            (self.seq_len // (2**self.conv_depth)) * (2**self.conv_depth)
-        ]
-
-        for idx in range(0, self.fc_depth - 1):
-            next_layer_size = self.linear_input_sizes[-1] // self.fc_scale_factor
-
-            if next_layer_size > self.latent_dim:
-                self.linear_input_sizes.append(next_layer_size)
-            else:
-                self.linear_input_sizes.append(self.latent_dim)
-
-    def build_tapered_encoding_fc_layer(self, layer_idx: int) -> Linear:
-        return Linear(
-            self.linear_input_sizes[layer_idx - 1], self.linear_input_sizes[layer_idx]
-        )
-
-    def build_tapered_decoding_fc_layer(self, layer_idx: int) -> Linear:
-        return Linear(
-            self.linear_input_sizes[layer_idx], self.linear_input_sizes[layer_idx - 1]
-        )
+        self.conv_output_size = (
+            self.seq_len // (2 ** (self.conv_depth + 1))
+        ) * self.n_filters
 
     def get_conv_padding(self) -> int:
         return self.layer_padding
@@ -95,25 +76,35 @@ class ConvolutionalEcgEncoder(torch.nn.Module):
         shared_params: ConvolutionalEcgEncoderDecoderSharedParams,
         batchnorm: bool = False,
         dropout: Optional[float] = None,
-        include_final_layer: bool = False,
     ):
         super().__init__()
 
         self.architecture_params = shared_params
         self.batchnorm = batchnorm
-        self.dropout = dropout
+        self.dropout = dropout  # TODO
 
         layers = list()
 
-        # Build Conv layers
+        # First layer
+        layers += [
+            Conv1d(
+                in_channels=1,
+                out_channels=self.architecture_params.n_filters,
+                kernel_size=self.architecture_params.kernel_size,
+                stride=2,
+                padding=self.architecture_params.get_conv_padding(),
+            ),
+            LeakyReLU(),
+        ]
+
+        # Build Additional Conv layers
         for idx in range(0, self.architecture_params.conv_depth):
-            in_channels = 2**idx
 
             layers += [
                 Conv1d(
-                    in_channels=in_channels,
-                    out_channels=2 * in_channels,
-                    kernel_size=shared_params.kernel_size,
+                    in_channels=self.architecture_params.n_filters,
+                    out_channels=self.architecture_params.n_filters,
+                    kernel_size=self.architecture_params.kernel_size,
                     stride=2,
                     padding=self.architecture_params.get_conv_padding(),
                 ),
@@ -121,27 +112,19 @@ class ConvolutionalEcgEncoder(torch.nn.Module):
             ]
 
             if self.batchnorm:
-                layers.append(BatchNorm1d(num_features=(2 * in_channels)))
+                layers.append(
+                    BatchNorm1d(num_features=(2 * self.architecture_params.n_filters))
+                )
 
         layers.append(Flatten(start_dim=1, end_dim=-1))
 
-        # Build FC layers
-        for idx in range(1, self.architecture_params.fc_depth):
-            layers += [
-                self.architecture_params.build_tapered_encoding_fc_layer(idx),
-                LeakyReLU(),
-            ]
-
-            if self.dropout:
-                layers.append(Dropout(self.dropout))
-
-        if include_final_layer:
-            layers.append(
-                Linear(
-                    self.architecture_params.linear_input_sizes[-1],
-                    self.architecture_params.latent_dim,
-                )
-            )
+        layers += [
+            Linear(
+                self.architecture_params.conv_output_size,
+                self.architecture_params.latent_dim,
+            ),
+            LeakyReLU(),
+        ]
 
         self.net = Sequential(*layers)
 
@@ -179,38 +162,27 @@ class ConvolutionalEcgDecoder(torch.nn.Module):
         layers += [
             Linear(
                 self.architecture_params.latent_dim,
-                self.architecture_params.linear_input_sizes[-1],
+                self.architecture_params.conv_output_size,
             ),
             LeakyReLU(),
         ]
-
-        for idx in range(self.architecture_params.fc_depth - 1, 0, -1):
-            layers += [
-                self.architecture_params.build_tapered_decoding_fc_layer(idx),
-                LeakyReLU(),
-            ]
-
-            if self.dropout:
-                layers.append(Dropout(self.dropout))
 
         layers.append(
             Unflatten(
                 dim=1,
                 unflattened_size=(
-                    (2**self.architecture_params.conv_depth),
-                    self.architecture_params.seq_len
-                    // (2**self.architecture_params.conv_depth),
+                    self.architecture_params.n_filters,
+                    -1,
                 ),
             ),
         )
 
         for idx in range(self.architecture_params.conv_depth, 0, -1):
-            in_channels = 2**idx
 
             layers += [
                 ConvTranspose1d(
-                    in_channels=in_channels,
-                    out_channels=in_channels // 2,
+                    in_channels=self.architecture_params.n_filters,
+                    out_channels=self.architecture_params.n_filters,
                     kernel_size=self.architecture_params.kernel_size,
                     padding=self.architecture_params.get_conv_padding(),
                     stride=2,
@@ -220,7 +192,20 @@ class ConvolutionalEcgDecoder(torch.nn.Module):
             ]
 
             if self.batchnorm:
-                layers.append(BatchNorm1d(num_features=in_channels // 2))
+                layers.append(
+                    BatchNorm1d(num_features=self.architecture_params.n_filters)
+                )
+
+        layers += [
+            ConvTranspose1d(
+                in_channels=self.architecture_params.n_filters,
+                out_channels=1,
+                kernel_size=self.architecture_params.kernel_size,
+                padding=self.architecture_params.get_conv_padding(),
+                stride=2,
+                output_padding=1,
+            )
+        ]
 
         self.net = Sequential(*layers)
 
@@ -241,16 +226,18 @@ class ConvolutionalEcgVAE(torch.nn.Module):
 
     def __init__(self, params: ConvolutionalEcgEncoderDecoderSharedParams):
         super(ConvolutionalEcgVAE, self).__init__()
-        self.encoder = ConvolutionalEcgEncoder(params)
-        self.decoder = ConvolutionalEcgDecoder(params)
+        self.architecture_params = params
+
+        self.encoder = ConvolutionalEcgEncoder(self.architecture_params)
+        self.decoder = ConvolutionalEcgDecoder(self.architecture_params)
 
         self.fc_mean = torch.nn.Linear(
-            self.encoder.architecture_params.linear_input_sizes[-1],
-            params.latent_dim,
+            self.architecture_params.latent_dim,
+            self.architecture_params.latent_dim,
         )
         self.fc_logvar = torch.nn.Linear(
-            self.encoder.architecture_params.linear_input_sizes[-1],
-            params.latent_dim,
+            self.architecture_params.latent_dim,
+            self.architecture_params.latent_dim,
         )
 
     def _get_mean_logvar(self, sig: torch.Tensor):
@@ -280,16 +267,14 @@ if __name__ == "__main__":
 
     sp = ConvolutionalEcgEncoderDecoderSharedParams(
         seq_len=1000,
-        kernel_size=7,
+        kernel_size=15,
         conv_depth=5,
-        fc_depth=3,
-        latent_dim=100,
-        fc_scale_factor=4,
+        latent_dim=25,
+        n_filters=16,
     )
 
     encoder = ConvolutionalEcgEncoder(
         shared_params=sp,
-        include_final_layer=True,
     ).to("cuda")
 
     decoder = ConvolutionalEcgDecoder(shared_params=sp).to("cuda")
@@ -298,7 +283,7 @@ if __name__ == "__main__":
 
     print()
 
-    summary(decoder, input_size=(8, 100))
+    summary(decoder, input_size=(8, sp.latent_dim))
 
     cvae = ConvolutionalEcgVAE(params=sp).to("cuda")
 
