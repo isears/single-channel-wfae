@@ -1,175 +1,314 @@
 import torch
-from torch.nn.functional import relu, max_pool1d_with_indices, max_unpool1d, avg_pool1d
-from torch.nn import Conv1d, ConvTranspose1d, Linear
+from torch.nn import (
+    Conv1d,
+    LeakyReLU,
+    BatchNorm1d,
+    MaxPool1d,
+    Linear,
+    ConvTranspose1d,
+    Upsample,
+    Sequential,
+    Flatten,
+    Unflatten,
+    Dropout,
+)
+
+from typing import Optional
+
 from torchinfo import summary
+from dataclasses import dataclass
+from typing import Optional
+
+
+# For debugging sequentials
+def print_sizes(model, input_tensor):
+    output = input_tensor
+    for m in model.children():
+        output = m(output)
+        print(m, output.shape)
+    return output
+
+
+@dataclass
+class ConvolutionalEcgEncoderDecoderSharedParams:
+    """
+    Util class that allows various architecture params to be computed only once
+    and shared between encoder and decoder
+
+    Ensures symmetry of architecture between encoder and decoder
+    """
+
+    seq_len: int
+    kernel_size: int
+    conv_depth: int
+    fc_depth: int
+    latent_dim: int
+    fc_scale_factor: int
+
+    def __post_init__(self):
+        self.input_padding_required = False
+
+        if not (self.seq_len % (2**self.conv_depth) == 0):
+            self.input_padding_required = True
+            pad_amount = (2**self.conv_depth) - (self.seq_len % (2**self.conv_depth))
+
+            print(
+                f"Warning: seq_len {self.seq_len} not divisible by 2 ** {self.conv_depth}, will pad up to {self.seq_len + pad_amount}"
+            )
+
+            self.seq_len = self.seq_len + pad_amount
+            self.left_pad = pad_amount // 2
+            self.right_pad = pad_amount - self.left_pad
+
+        self.layer_padding = (self.kernel_size - 1) // 2
+
+        self.linear_input_sizes = [
+            (self.seq_len // (2**self.conv_depth)) * (2**self.conv_depth)
+        ]
+
+        for idx in range(0, self.fc_depth - 1):
+            next_layer_size = self.linear_input_sizes[-1] // self.fc_scale_factor
+
+            if next_layer_size > self.latent_dim:
+                self.linear_input_sizes.append(next_layer_size)
+            else:
+                self.linear_input_sizes.append(self.latent_dim)
+
+    def build_tapered_encoding_fc_layer(self, layer_idx: int) -> Linear:
+        return Linear(
+            self.linear_input_sizes[layer_idx - 1], self.linear_input_sizes[layer_idx]
+        )
+
+    def build_tapered_decoding_fc_layer(self, layer_idx: int) -> Linear:
+        return Linear(
+            self.linear_input_sizes[layer_idx], self.linear_input_sizes[layer_idx - 1]
+        )
+
+    def get_conv_padding(self) -> int:
+        return self.layer_padding
 
 
 class ConvolutionalEcgEncoder(torch.nn.Module):
-    """
-    Two-layer convolutional ECG encoder
-    - Expects 10s single channel ECG data (any channel) at 100Hz
-    - Relatively large first-layer convolution kernel (7) to smooth out high frequency noise
-    - Relatively small second-layer convolution kernel (3) for recognition of higher level features
-    - Max pooling between layers w/kernel size equal to preceeding layer
-    - seq_len dimension will go from 1000 -> 47
-    - Theoretical maximum recognizable number of unique waves: n_filters^2
-    """
 
-    def __init__(self, n_filters: int):
-        super(ConvolutionalEcgEncoder, self).__init__()
+    def __init__(
+        self,
+        shared_params: ConvolutionalEcgEncoderDecoderSharedParams,
+        batchnorm: bool = False,
+        dropout: Optional[float] = None,
+        include_final_layer: bool = False,
+    ):
+        super().__init__()
 
-        self.n_filters = n_filters
+        self.architecture_params = shared_params
+        self.batchnorm = batchnorm
+        self.dropout = dropout
 
-        self.conv1 = Conv1d(
-            in_channels=1, out_channels=n_filters, kernel_size=7, padding=3
-        )
-        self.conv2 = Conv1d(
-            in_channels=n_filters,
-            out_channels=n_filters**2,
-            kernel_size=3,
-            padding=1,
-        )
+        layers = list()
 
-    def forward(self, x: torch.Tensor):
-        out = self.conv1(x)
-        out = relu(out)
-        out, first_layer_indices = max_pool1d_with_indices(
-            out, kernel_size=(7,), return_indices=True
-        )
-        out = self.conv2(out)
-        out = relu(out)
-        out, second_layer_indices = max_pool1d_with_indices(
-            out, kernel_size=(3,), return_indices=True
-        )
+        # Build Conv layers
+        for idx in range(0, self.architecture_params.conv_depth):
+            in_channels = 2**idx
 
-        out = avg_pool1d(out, kernel_size=(47,))
+            layers += [
+                Conv1d(
+                    in_channels=in_channels,
+                    out_channels=2 * in_channels,
+                    kernel_size=shared_params.kernel_size,
+                    stride=2,
+                    padding=self.architecture_params.get_conv_padding(),
+                ),
+                LeakyReLU(),
+            ]
 
-        return out, first_layer_indices, second_layer_indices
+            if self.batchnorm:
+                layers.append(BatchNorm1d(num_features=(2 * in_channels)))
+
+        layers.append(Flatten(start_dim=1, end_dim=-1))
+
+        # Build FC layers
+        for idx in range(1, self.architecture_params.fc_depth):
+            layers += [
+                self.architecture_params.build_tapered_encoding_fc_layer(idx),
+                LeakyReLU(),
+            ]
+
+            if self.dropout:
+                layers.append(Dropout(self.dropout))
+
+        if include_final_layer:
+            layers.append(
+                Linear(
+                    self.architecture_params.linear_input_sizes[-1],
+                    self.architecture_params.latent_dim,
+                )
+            )
+
+        self.net = Sequential(*layers)
+
+    def forward(self, x):
+        if self.architecture_params.input_padding_required:
+            x = torch.nn.functional.pad(
+                x,
+                pad=(
+                    self.architecture_params.left_pad,
+                    self.architecture_params.right_pad,
+                ),
+                value=0.0,
+            )
+
+        return self.net(x)
 
 
 class ConvolutionalEcgDecoder(torch.nn.Module):
-    """
-    Decoder counterpart to encoder
 
-    - Mirror image architecture
-    - Supports raw autoencoder design by accepting encoder output directly
-        - E.g. reconstruction = decoder(encoder(x))
-    - Need intermediate module for variational autoencoder functionality
-    - Must be initialized with same number of filters as encoder
-    """
-
-    def __init__(self, n_filters: int):
-        super(ConvolutionalEcgDecoder, self).__init__()
-
-        self.n_filters = n_filters
-
-        self.conv1 = ConvTranspose1d(
-            in_channels=n_filters**2,
-            out_channels=n_filters,
-            kernel_size=3,
-        )
-
-        self.conv2 = ConvTranspose1d(
-            in_channels=n_filters, out_channels=1, kernel_size=7
-        )
-
-    def forward(
+    def __init__(
         self,
-        x: torch.Tensor,
-        first_layer_indices: torch.Tensor,
-        second_layer_indices: torch.Tensor,
+        shared_params: ConvolutionalEcgEncoderDecoderSharedParams,
+        batchnorm: bool = False,
+        dropout: Optional[float] = None,
     ):
-        batch_size, n_filters, _ = x.shape
-        out = x.expand((batch_size, n_filters, 47))
-        out = max_unpool1d(out, indices=second_layer_indices, kernel_size=(3,))
-        out = relu(out)
-        out = self.conv1(out)
+        super().__init__()
 
-        # Essentially, a reverse pad. Need to drop 5 elements
-        # TODO: this is fragile and will break with changing kernels, need to make more robust
-        out = out[:, :, :-1]
+        self.batchnorm = batchnorm
+        self.dropout = dropout
+        self.padding_required = False
 
-        out = max_unpool1d(out, indices=first_layer_indices, kernel_size=(7,))
-        out = self.conv2(out)
-        # TODO: consider better activation layers
-        # out = relu(out)
+        self.architecture_params = shared_params
 
-        return out
+        layers = list()
+        layers += [
+            Linear(
+                self.architecture_params.latent_dim,
+                self.architecture_params.linear_input_sizes[-1],
+            ),
+            LeakyReLU(),
+        ]
 
+        for idx in range(self.architecture_params.fc_depth - 1, 0, -1):
+            layers += [
+                self.architecture_params.build_tapered_decoding_fc_layer(idx),
+                LeakyReLU(),
+            ]
 
-class ConvolutionalEcgAutoencoder(torch.nn.Module):
-    def __init__(self, n_filters: int = 16):
-        super(ConvolutionalEcgAutoencoder, self).__init__()
-        self.encoder = ConvolutionalEcgEncoder(n_filters)
-        self.decoder = ConvolutionalEcgDecoder(n_filters)
+            if self.dropout:
+                layers.append(Dropout(self.dropout))
+
+        layers.append(
+            Unflatten(
+                dim=1,
+                unflattened_size=(
+                    (2**self.architecture_params.conv_depth),
+                    self.architecture_params.seq_len
+                    // (2**self.architecture_params.conv_depth),
+                ),
+            ),
+        )
+
+        for idx in range(self.architecture_params.conv_depth, 0, -1):
+            in_channels = 2**idx
+
+            layers += [
+                ConvTranspose1d(
+                    in_channels=in_channels,
+                    out_channels=in_channels // 2,
+                    kernel_size=self.architecture_params.kernel_size,
+                    padding=self.architecture_params.get_conv_padding(),
+                    stride=2,
+                    output_padding=1,
+                ),
+                LeakyReLU(),
+            ]
+
+            if self.batchnorm:
+                layers.append(BatchNorm1d(num_features=in_channels // 2))
+
+        self.net = Sequential(*layers)
 
     def forward(self, x):
-        z, indices1, indices2 = self.encoder(x)
-        reconstruction = self.decoder(z, indices1, indices2)
+        out = self.net(x)
 
-        return reconstruction
+        if self.architecture_params.input_padding_required:
+            return out[
+                :,
+                :,
+                self.architecture_params.left_pad : -self.architecture_params.right_pad,
+            ].contiguous()
+        else:
+            return out
 
 
 class ConvolutionalEcgVAE(torch.nn.Module):
-    def __init__(self, n_filters: int = 16, latent_dim: int = 64):
+
+    def __init__(self, params: ConvolutionalEcgEncoderDecoderSharedParams):
         super(ConvolutionalEcgVAE, self).__init__()
+        self.encoder = ConvolutionalEcgEncoder(params)
+        self.decoder = ConvolutionalEcgDecoder(params)
 
-        self.encoder = ConvolutionalEcgEncoder(n_filters)
-        self.decoder = ConvolutionalEcgDecoder(n_filters)
-
-        self.fc_mean = Linear(n_filters**2, latent_dim)
-        self.fc_logvar = Linear(n_filters**2, latent_dim)
-        self.fc_decode = Linear(latent_dim, n_filters**2)
-
-    def encode(self, x):
-        enc_raw, _, _ = self.encoder(x)
-        mu = self.fc_mean(enc_raw.squeeze())
-        sigma = self.fc_logvar(enc_raw.squeeze())
-
-        # Reparameterization
-        batch, dim = mu.shape
-        epsilon = (
-            torch.distributions.normal.Normal(0, 1).sample((batch, dim)).to(mu.device)
+        self.fc_mean = torch.nn.Linear(
+            self.encoder.architecture_params.linear_input_sizes[-1],
+            params.latent_dim,
+        )
+        self.fc_logvar = torch.nn.Linear(
+            self.encoder.architecture_params.linear_input_sizes[-1],
+            params.latent_dim,
         )
 
-        return mu + torch.exp(0.5 * sigma) * epsilon
+    def _get_mean_logvar(self, sig: torch.Tensor):
+        encoded = self.encoder(sig)
 
-    def forward(self, x):
-        enc_raw, indices1, indices2 = self.encoder(x)
-        mu = self.fc_mean(enc_raw.squeeze())
-        sigma = self.fc_logvar(enc_raw.squeeze())
+        mu = self.fc_mean(encoded)
+        log_var = self.fc_logvar(encoded)
 
-        # Reparameterization
-        batch, dim = mu.shape
-        epsilon = (
-            torch.distributions.normal.Normal(0, 1).sample((batch, dim)).to(mu.device)
-        )
+        return mu, log_var
 
-        z = mu + torch.exp(0.5 * sigma) * epsilon
+    def vae_encode(self, sig: torch.Tensor):
+        mu, log_var = self._get_mean_logvar(sig)
+        return self.reparametrize(mu, log_var)
 
-        reconstruction = self.decoder(
-            self.fc_decode(z).unsqueeze(-1), indices1, indices2
-        )
+    def reparametrize(self, mu: torch.Tensor, logvar: torch.Tensor):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
 
-        return reconstruction, mu, sigma
+    def forward(self, sig: torch.Tensor):
+        mu, log_var = self._get_mean_logvar(sig)
+        z = self.reparametrize(mu, log_var)
+        return self.decoder(z), mu, log_var
 
 
 if __name__ == "__main__":
-    e = ConvolutionalEcgEncoder(n_filters=16)
-    d = ConvolutionalEcgDecoder(n_filters=16)
 
-    x_sample = torch.rand((32, 1, 1000))
+    sp = ConvolutionalEcgEncoderDecoderSharedParams(
+        seq_len=1000,
+        kernel_size=7,
+        conv_depth=5,
+        fc_depth=3,
+        latent_dim=100,
+        fc_scale_factor=4,
+    )
 
-    summary(e, input_data=x_sample)
+    encoder = ConvolutionalEcgEncoder(
+        shared_params=sp,
+        include_final_layer=True,
+    ).to("cuda")
 
-    x_hat, i1, i2 = e(x_sample)
+    decoder = ConvolutionalEcgDecoder(shared_params=sp).to("cuda")
+
+    summary(encoder, input_size=(8, 1, 1000))
+
     print()
-    summary(d, input_data=(x_hat, i1, i2))
 
-    ae = ConvolutionalEcgAutoencoder()
-    print()
-    summary(ae, input_data=(x_sample))
+    summary(decoder, input_size=(8, 100))
 
-    vae = ConvolutionalEcgVAE()
+    cvae = ConvolutionalEcgVAE(params=sp).to("cuda")
+
     print()
-    summary(vae, input_data=(x_sample))
+
+    summary(cvae, input_size=(8, 1, 1000))
+
+    x = torch.randn((8, 1, 1000)).to("cuda")
+    print(f"X:\t\t{x.shape}")
+    e = encoder(x)
+    print(f"E:\t\t{e.shape}")
+    d = decoder(e)
+    print(f"D:\t\t{d.shape}")
