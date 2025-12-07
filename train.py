@@ -17,7 +17,11 @@ LEARNING_RATE = 0.0003016868024815632
 
 
 def calculate_losses(
-    preds: torch.Tensor, target: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    beta: float = 1.0,
 ):
     mrstft = auraloss.freq.STFTLoss()
     reproduction_loss = F.mse_loss(preds, target, reduction="sum")
@@ -26,7 +30,7 @@ def calculate_losses(
     mean_mse = F.mse_loss(preds, target, reduction="mean")
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    return reproduction_loss + KLD * 1e-3, reproduction_loss, KLD, mean_mse
+    return reproduction_loss + KLD * beta, reproduction_loss, KLD, mean_mse
     # return reproduction_loss, reproduction_loss, KLD, mean_mse
 
 
@@ -69,7 +73,7 @@ if __name__ == "__main__":
             seq_len=1000,
             kernel_size=15,
             conv_depth=5,
-            latent_dim=25,
+            latent_dim=20,
             n_filters=16,
         )
     ).to("cuda")
@@ -81,10 +85,13 @@ if __name__ == "__main__":
     )
     best_val_loss = float("inf")
     curr_val_loss = float("inf")
-    sigma = 0.0001
+    initial_beta = 1e-4
 
     for epoch in range(MAX_EPOCHS):
         print(f"--> Training epoch {epoch}")
+
+        # beta annealing, every 100 epochs, increase by an order of magnitude (up to 4)
+        beta = min((10 ** (epoch // 100)) * initial_beta, 4)
 
         model.eval()
 
@@ -106,7 +113,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 reconstruction, mu, logvar = model(val_sig.unsqueeze(1))
                 combined_loss, reproduction_loss, KLD, mean_mse = calculate_losses(
-                    reconstruction, val_sig.unsqueeze(1), mu, logvar
+                    reconstruction, val_sig.unsqueeze(1), mu, logvar, beta
                 )
 
             val_combined_loss.update(combined_loss)
@@ -124,6 +131,7 @@ if __name__ == "__main__":
         else:
             print(f"Epoch {epoch:04d} {scheduler.get_last_lr()}")
 
+        print(f"\tBeta: {beta}")
         print(f"\tVal Combined Loss: {val_combined_loss.compute():5f}")
         print(f"\tVal Reproduction Loss: {val_reproduction_loss.compute():5f}")
         print(f"\tVal Mean MSE: {val_mean_mse.compute():5f}")
@@ -137,7 +145,7 @@ if __name__ == "__main__":
             # sig = gaussian_smooth1d(sig, sigma=sigma)
             reconstruction, mu, logvar = model(sig.unsqueeze(1))
             loss, _, _, _ = calculate_losses(
-                reconstruction, sig.unsqueeze(1), mu, logvar
+                reconstruction, sig.unsqueeze(1), mu, logvar, beta
             )
             optimizer.zero_grad()
             loss.backward()
