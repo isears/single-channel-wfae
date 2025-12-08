@@ -16,8 +16,8 @@ from torch.nn import (
 from typing import Optional
 
 from torchinfo import summary
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, asdict
+from typing import Optional, Self
 
 
 # For debugging sequentials
@@ -55,14 +55,16 @@ class ConvolutionalEcgEncoderDecoderSharedParams:
                 f"Warning: seq_len {self.seq_len} not divisible by 2 ** {self.conv_depth}, will pad up to {self.seq_len + pad_amount}"
             )
 
-            self.seq_len = self.seq_len + pad_amount
+            self.seq_len_padded = self.seq_len + pad_amount
             self.left_pad = pad_amount // 2
             self.right_pad = pad_amount - self.left_pad
+        else:
+            self.seq_len_padded = self.seq_len
 
         self.layer_padding = (self.kernel_size - 1) // 2
 
         self.conv_output_size = (
-            self.seq_len // (2 ** (self.conv_depth + 1))
+            self.seq_len_padded // (2 ** (self.conv_depth + 1))
         ) * self.n_filters
 
     def get_conv_padding(self) -> int:
@@ -262,9 +264,20 @@ class ConvolutionalEcgVAE(torch.nn.Module):
         z = self.reparametrize(mu, log_var)
         return self.decoder(z), mu, log_var
 
+    def save(self, path: str):
+        state_dict = self.state_dict()
+        state_dict["config"] = asdict(self.architecture_params)
+        torch.save(state_dict, path)
+
+    @classmethod
+    def load(cls, path: str) -> Self:
+        data = torch.load(path, weights_only=True)
+        m = cls(ConvolutionalEcgEncoderDecoderSharedParams(**data.pop("config")))
+        m.load_state_dict(data)
+        return m
+
 
 if __name__ == "__main__":
-
     sp = ConvolutionalEcgEncoderDecoderSharedParams(
         seq_len=1000,
         kernel_size=15,

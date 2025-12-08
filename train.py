@@ -13,7 +13,9 @@ from scwfae.model.ConvolutionalEcgModules import *
 
 
 MAX_EPOCHS = 1000
-LEARNING_RATE = 0.0003016868024815632
+# LEARNING_RATE = 0.0003016868024815632
+LEARNING_RATE = 1e-4
+BETA_ANNEALING = False
 
 
 def calculate_losses(
@@ -85,13 +87,16 @@ if __name__ == "__main__":
     )
     best_val_loss = float("inf")
     curr_val_loss = float("inf")
-    initial_beta = 1e-4
+    initial_beta = 5e-4
 
     for epoch in range(MAX_EPOCHS):
         print(f"--> Training epoch {epoch}")
 
-        # beta annealing, every 100 epochs, increase by an order of magnitude (up to 4)
-        beta = min((10 ** (epoch // 100)) * initial_beta, 4)
+        if BETA_ANNEALING:
+            # beta annealing, every 100 epochs, increase by an order of magnitude (up to 4)
+            beta = min((10 ** (epoch // 100)) * initial_beta, 10)
+        else:
+            beta = initial_beta
 
         model.eval()
 
@@ -108,7 +113,6 @@ if __name__ == "__main__":
         for val_batchnum, val_batch in enumerate(val_dl):
             val_sig, val_labels = val_batch
             val_sig = val_sig.to("cuda")
-            # val_sig = gaussian_smooth1d(val_sig, sigma=sigma)
 
             with torch.no_grad():
                 reconstruction, mu, logvar = model(val_sig.unsqueeze(1))
@@ -126,7 +130,8 @@ if __name__ == "__main__":
             best_val_loss = curr_val_loss
 
             print(f"Epoch {epoch:04d} {scheduler.get_last_lr()}(*)")
-            torch.save(model.state_dict(), "cache/savedmodels/ecgvae.pt")
+            model.save("cache/savedmodels/ecgvae.pt")
+            # torch.save(model.state_dict(), "cache/savedmodels/ecgvae.pt")
 
         else:
             print(f"Epoch {epoch:04d} {scheduler.get_last_lr()}")
@@ -152,4 +157,4 @@ if __name__ == "__main__":
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=4.0)
             optimizer.step()
 
-        scheduler.step(curr_val_loss)
+        # scheduler.step(curr_val_loss)
